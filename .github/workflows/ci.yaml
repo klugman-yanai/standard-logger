@@ -1,0 +1,64 @@
+name: Build and Publish Wheel
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install build tools
+        run: |
+          pip install uv toml
+
+      - name: Build project wheel with uv
+        run: |
+          uv build
+
+      - name: Upload wheel as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-wheel
+          path: dist/*.whl
+
+      - name: Get latest Git tag
+        id: latest_tag
+        run: |
+          echo "tag=$(git tag --sort=-v:refname | head -n 1)" >> $GITHUB_OUTPUT
+
+      - name: Get current version from pyproject.toml
+        id: current_version
+        run: |
+          echo "version=$(python -c "import toml; print(toml.load(open('pyproject.toml'))['project'].get('version', ''))")" >> $GITHUB_OUTPUT
+
+      - name: Check if local version is newer
+        id: version_check
+        run: |
+          if [ "${{ steps.current_version.outputs.version }}" != "${{ steps.latest_tag.outputs.tag }}" ]; then
+            echo "new_version=true" >> $GITHUB_OUTPUT
+          else
+            echo "new_version=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Tag new version (if needed)
+        if: steps.version_check.outputs.new_version == 'true'
+        env:
+          VERSION: ${{ steps.current_version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$VERSION"
+          git push origin "$VERSION"
+
+      - name: Complete
+        run: echo "Build complete. Wheel saved as artifact."
