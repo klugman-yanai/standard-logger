@@ -164,52 +164,43 @@ def _handle_raise(error: Exception, message: str) -> None:
 
 def _get_default_log_file_path(app_name: str, app_author: str | None) -> Path:
     """
-    Generates the default platform-specific log file path using platformdirs.
+    Generates the default platform-specific log file path stem (no extension).
 
-    Constructs path like .../AppAuthor/AppName/Logs/logfile.log. Falls back
-    cautiously to './logs' in the current working directory if platform-specific
-    paths fail.
+    Constructs path like .../AppAuthor/AppName/Logs/prefix_timestamp. Falls back
+    cautiously to './logs/prefix_timestamp' if platform-specific paths fail.
+    The final extension (.log or .jsonl) is added later based on config.
 
-    Parameters
-    ----------
-    app_name : str
-        The application name (used for directory structure).
-    app_author : str | None
-        The application author (used for directory structure).
-
-    Raises
-    ------
-    LoggerSetupError
-        If neither the platform-specific nor fallback directory can be
-        created or written to.
+    Parameters are the same as before...
+    Raises are the same as before...
 
     Returns
     -------
     Path
-        The resolved Path object for the default log file.
+        The resolved Path object for the default log file stem (directory + prefix + timestamp).
     """
     log_dir: Path | None = None
+    setup_error: Exception | None = None
+
+    # --- Try Platform-Specific Directory ---
     try:
-        # First attempt: Use platformdirs for platform-specific log directory
         platform_log_dir: Path = Path(
             platformdirs.user_log_path(
                 appname=app_name,
-                appauthor=app_author,  # platformdirs handles None author correctly
+                appauthor=app_author,
             ),
         )
         platform_log_dir.mkdir(parents=True, exist_ok=True)
+        if not os.access(str(platform_log_dir), os.W_OK):
+            raise PermissionError(f'No write permission for platform log directory: {platform_log_dir}')
         log_dir = platform_log_dir
-        if not os.access(str(log_dir), os.W_OK):
-            raise PermissionError(f'No write permission for log directory: {log_dir}')
         logging.debug(f'Using platform default log directory: {log_dir}')
 
     except Exception as e:
-        # Platform-specific path failed (permissions, OS error, etc.)
-        # --- Fallback to CWD/logs ---
-        logging.exception("CRITICAL FALLBACK to './logs'", exc_info=e)
+        logging.warning(f"Failed to use platform log path: {e}. Falling back to CWD.")
+        logging.debug("Platform path exception details:", exc_info=e)
 
+        # --- Fallback to CWD/logs ---
         try:
-            # Second attempt: Create 'logs' directory in current working directory
             fallback_dir: Path = Path.cwd() / DEFAULT_LOG_DIRECTORY_NAME
             fallback_dir.mkdir(parents=True, exist_ok=True)
             if not os.access(str(fallback_dir), os.W_OK):
@@ -217,19 +208,27 @@ def _get_default_log_file_path(app_name: str, app_author: str | None) -> Path:
             log_dir = fallback_dir
             logging.warning(f'Using fallback log directory: {log_dir}')
         except Exception as fallback_e:
-            # If even fallback fails, setup cannot proceed with default path
-            _handle_raise(fallback_e, 'Could not establish any writable default log directory.')
+            logging.exception("Fallback log directory setup failed.", exc_info=fallback_e)
+            setup_error = fallback_e
 
+    # --- Raise If Critical Failure During Fallback ---
+    if setup_error:
+        _handle_raise(setup_error, 'Could not establish any writable default log directory.')
+
+    # --- Final Check ---
     if log_dir is None:
-        raise LoggerSetupError('log_dir was not set. This should not happen.')
+        raise RuntimeError("log_dir is none")
 
-    # --- Generate Filename with Timestamp ---
+    # --- Generate Filename STEM (no extension) ---
     timestamp: str = time.strftime('%Y%m%d_%H%M%S')
-    filename: str = f'{DEFAULT_LOG_FILENAME_PREFIX}{timestamp}.log'
-    final_path: Path = log_dir / filename
+    # CHANGE: Generate only the stem part of the filename
+    filename_stem: str = f'{DEFAULT_LOG_FILENAME_PREFIX}{timestamp}'
+    # CHANGE: Return the path including the stem but no suffix
+    base_log_path: Path = log_dir / filename_stem
 
-    logging.debug(f'Default log path determined: {final_path}')
-    return final_path
+    logging.debug(f'Default log path stem determined: {base_log_path}')
+    # CHANGE: Return the base path without suffix
+    return base_log_path
 
 
 def _configure_root_logger(
@@ -398,8 +397,8 @@ def _render_ascii_panel(
         inner_width = target_width - 4
 
     # Use box drawing characters for a slightly nicer look than pure ASCII
-    top = f'╭{"─" * (target_width - 2)}╮'
-    bottom = f'╰{"─" * (target_width - 2)}╯'
+    top = f'╭{"─" * (target_width - 4)}╮'
+    bottom = f'╰{"─" * (target_width - 4)}╯'
     lines.append(top)
     if title_str:
         # Center title, truncate if necessary

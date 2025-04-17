@@ -1,0 +1,5 @@
+site_name: Standard Logger
+theme:
+  name: material
+nav:
+  - Home: index.md

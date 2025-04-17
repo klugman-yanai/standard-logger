@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 
 [project]
-name = "standard_logger"
+name = "standard-logger"
 dynamic = ["version"]
 description = "Add your description here"
 readme = "README.md"
@@ -28,6 +28,8 @@ source = "vcs"
 dev = [
     "build>=1.2.2.post1",
     "hatchling>=1.27.0",
+    "mkdocs>=1.6.1",
+    "mkdocs-material>=9.6.11",
 ]
 
 [tool.hatch.build.targets.wheel]

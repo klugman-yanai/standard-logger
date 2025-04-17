@@ -679,34 +679,6 @@ def setup_logging(config: LoggerConfig) -> tuple[bool, Path | None]:
     Returns
     -------
     tuple[bool, Path | None]
-        (file_logging_enabled, actual_log_path)
-    """
-
-    def _raise_critical(msg: str, exc: Exception, *, re_raise: bool = False) -> None:
-        """
-        Helper for critical error logging and raising.
-        If re_raise is True, re-raises the given exception after logging.
-        Otherwise, raises LoggerSetupError from the given exception.
-        """
-        logging.critical(msg, exc_info=exc)
-        if re_raise:
-            raise exc
-        raise LoggerSetupError(msg) from exc
-
-    """
-    Initializes and configures the root logger based on LoggerConfig.
-
-    Sets the global logger class to StandardLogger, so subsequent calls to
-    `logging.getLogger(name)` will return configured StandardLogger instances.
-
-    Parameters
-    ----------
-    config : LoggerConfig
-        The configuration object specifying logger settings.
-
-    Returns
-    -------
-    tuple[bool, Path | None]
         A tuple containing:
             - A boolean indicating if file logging was successfully enabled.
             - The actual Path object used for file logging, or None.
@@ -716,132 +688,195 @@ def setup_logging(config: LoggerConfig) -> tuple[bool, Path | None]:
     LoggerSetupError
         If critical errors occur during setup (e.g., directory permissions).
     """
-    # Justification for > 20 lines: Orchestrates entire setup process.
+
+    # Use default config if none provided
+    effective_config = config if config is not None else LoggerConfig()
+
+    # Helper for critical errors during setup
+    def _raise_critical(msg: str, exc: Exception, *, re_raise: bool = False) -> None:
+        logging.critical(f'LOGGER SETUP FAILURE: {msg}', exc_info=exc)
+        if re_raise:
+            raise exc
+        raise LoggerSetupError(msg) from exc
+
     actual_log_path: Path | None = None
     file_logging_enabled = False
-    file_logging_error: str | None = None
-    root_logger: logging.Logger | None = None
+    file_logging_error_reason: str | None = None
+    root_logger: StandardLogger | None = None  # Type hint adjusted
 
     try:
+        # --- Validate Config ---
         try:
-            config.__post_init__()  # Trigger validation
+            effective_config.__post_init__()
         except Exception as e:
-            logging.warning(f'LoggerConfig validation failed: {e}')
+            logging.warning(f'LoggerConfig validation/normalization issue: {e}')
 
-        # Install Rich hook ONLY if Rich console AND Rich tracebacks are enabled
-        if config.use_rich_console and not config.use_simple_tracebacks:
-            _install_rich_traceback_hook(_rich_console, show_locals=config.show_locals_on_exception)
+        # --- Install Uncaught Exception Hook ---
+        if effective_config.use_rich_console and not effective_config.use_simple_tracebacks:
+            try:
+                _install_rich_traceback_hook(
+                    _rich_console,
+                    show_locals=effective_config.show_locals_on_exception,
+                )
+            except Exception as hook_e:
+                logging.warning(f'Failed to install Rich traceback hook: {hook_e}', exc_info=hook_e)
 
         # --- File Path Determination ---
-        match config.log_file_path:
-            case False:
-                logging.debug('File logging disabled.')
-            case None:  # Auto-generate
-                try:
-                    actual_log_path = _get_default_log_file_path(config.app_name, config.app_author)
-                except LoggerSetupError as e:
-                    file_logging_error = f'{e.args[0] if e.args else e}'
-                    logging.exception(f'Config Error: {file_logging_error}. File logging disabled.')
-                except Exception as e:
-                    file_logging_error = 'Unexpected default path error'
-                    logging.exception(file_logging_error, exc_info=e)
-            case str() | Path() as user_path:  # User-specified path
-                p = Path(user_path).resolve()
-                try:
-                    p.parent.mkdir(parents=True, exist_ok=True)
-                    if not os.access(str(p.parent), os.W_OK):
-                        _raise_critical(
-                            f'No write permission for log directory: {p.parent}',
-                            PermissionError(f'No write permission for log directory: {p.parent}'),
-                        )
-                    actual_log_path = p
-                except Exception as e:
-                    file_logging_error = f"Path error '{user_path}'"
-                    logging.exception(file_logging_error, exc_info=e)
-            case _:
-                file_logging_error = f'Invalid log_file_path type: {type(config.log_file_path)}.'
-                logging.error(f'Config Error: {file_logging_error}. File logging disabled.')
-        # Ensure path is None if error occurred
-        if file_logging_error:
+        # This section now handles adding the default suffix
+        if effective_config.log_file_path is False:
+            logging.debug('File logging explicitly disabled by config.')
+            file_logging_error_reason = 'Explicitly disabled'
+
+        elif effective_config.log_file_path is None:  # Auto-generate default path
+            try:
+                # CHANGE: Get the base path (stem) without extension
+                base_log_path = _get_default_log_file_path(
+                    effective_config.app_name,
+                    effective_config.app_author,
+                )
+                # CHANGE: Determine suffix based on serialization config
+                default_suffix = '.jsonl' if effective_config.log_file_serialize else '.log'
+                # CHANGE: Apply the determined suffix
+                actual_log_path = base_log_path.with_suffix(default_suffix)
+                # Ensure parent dir exists (may have been created by _get_default_log_file_path)
+                actual_log_path.parent.mkdir(parents=True, exist_ok=True)
+
+            except LoggerSetupError as e_path:
+                file_logging_error_reason = f'{e_path.args[0] if e_path.args else e_path}'
+                logging.exception(f'Config Error: {file_logging_error_reason}. File logging disabled.')
+            except Exception as e_path_unexp:
+                file_logging_error_reason = 'Unexpected error generating default log path'
+                logging.exception(
+                    f'{file_logging_error_reason}. File logging disabled.', exc_info=e_path_unexp,
+                )
+
+        elif isinstance(effective_config.log_file_path, (str, Path)):  # User-specified path
+            user_path = Path(effective_config.log_file_path).resolve()
+            try:
+                user_path.parent.mkdir(parents=True, exist_ok=True)
+                if not os.access(str(user_path.parent), os.W_OK):
+                    raise PermissionError(f'No write permission for log directory: {user_path.parent}')
+                # CHANGE: Assign the user's resolved path directly, respecting their extension
+                actual_log_path = user_path
+            except PermissionError as e_perm:
+                file_logging_error_reason = f'Permission denied for log directory: {user_path.parent}'
+                logging.exception(
+                    f'Config Error: {file_logging_error_reason}. File logging disabled.', exc_info=e_perm,
+                )
+            except Exception as e_user_path:
+                file_logging_error_reason = f"Error accessing specified log path '{user_path}'"
+                logging.exception(
+                    f'{file_logging_error_reason}. File logging disabled.', exc_info=e_user_path,
+                )
+
+        else:  # Invalid type for log_file_path
+            file_logging_error_reason = (
+                f'Invalid log_file_path type: {type(effective_config.log_file_path)}.'
+            )
+            logging.error(f'Config Error: {file_logging_error_reason}. File logging disabled.')
+
+        # Ensure path is None if any error occurred during path setup
+        if file_logging_error_reason and actual_log_path is not None:
             actual_log_path = None
 
-        # --- Determine Min Level & Configure Root Logger ---
-        min_level = config.console_level
+        # --- Determine Minimum Processing Level & Configure Root Logger ---
+        min_level = effective_config.console_level
         if actual_log_path:
-            min_level = min(min_level, config.file_level)
-        # Configure root logger, sets StandardLogger globally
-        root_logger = _configure_root_logger(StandardLogger, min_level)
+            min_level = min(min_level, effective_config.file_level)
 
-        # Set class variables on StandardLogger for runtime checks in instance methods
-        StandardLogger._show_locals_in_traceback_cls = config.show_locals_on_exception
-        StandardLogger._use_rich_console_cls = config.use_rich_console
-        StandardLogger._use_simple_tracebacks_cls = config.use_simple_tracebacks
+        root_logger = _configure_root_logger(StandardLogger, min_level)  # Type hint fixed here
+
+        # --- Set Class Variables on StandardLogger ---
+        StandardLogger._show_locals_in_traceback_cls = effective_config.show_locals_on_exception
+        StandardLogger._use_rich_console_cls = effective_config.use_rich_console
+        StandardLogger._use_simple_tracebacks_cls = effective_config.use_simple_tracebacks
 
         # --- Setup Loguru Sinks & Interception ---
-        loguru_sink_handler.remove()  # Clear Loguru defaults
-        root_logger.addHandler(LoguruInterceptHandler())  # Add intercept to root
+        loguru_sink_handler.remove()
+        # Type hint check: root_logger will be StandardLogger or None if setup fails earlier
+        if root_logger:
+            root_logger.addHandler(LoguruInterceptHandler())
+        else:
+            # This case should be unlikely if _configure_root_logger raises on failure, but defensive
+            _raise_critical(
+                'Root logger configuration failed unexpectedly.', RuntimeError('Root logger is None'),
+            )
 
         # --- Configure Console Output ---
-        if config.use_rich_console:
+        if effective_config.use_rich_console:
             rich_handler = _setup_rich_console_handler(
                 _rich_console,
-                config.console_level,
-                config.console_time_format,
-                use_simple_tracebacks=config.use_simple_tracebacks,
+                effective_config.console_level,
+                effective_config.console_time_format,
+                use_simple_tracebacks=effective_config.use_simple_tracebacks,
             )
             rich_handler.tracebacks_show_locals = (
-                config.show_locals_on_exception and not config.use_simple_tracebacks
+                effective_config.show_locals_on_exception and not effective_config.use_simple_tracebacks
             )
-            root_logger.addHandler(rich_handler)  # Add handler to root
+            if root_logger:  # Add handler only if root logger exists
+                root_logger.addHandler(rich_handler)
         else:
             _configure_loguru_console_sink(
-                config.console_level,
-                config.console_time_format,
-            )  # Loguru handles console
+                effective_config.console_level,
+                effective_config.console_time_format,
+            )
 
         # --- Configure File Sink (Via Loguru) ---
-        if actual_log_path:
+        if actual_log_path:  # Proceed only if a valid path was determined
             try:
                 _setup_loguru_file_sink(
-                    log_file_path=actual_log_path,
-                    level=config.file_level,
-                    file_format=config.log_file_format,
-                    rotation=config.log_file_rotation,
-                    retention=config.log_file_retention,
-                    serialize=config.log_file_serialize,
+                    log_file_path=actual_log_path,  # Use the potentially suffixed path
+                    level=effective_config.file_level,
+                    file_format=effective_config.log_file_format,  # Only used if serialize=False
+                    rotation=effective_config.log_file_rotation,
+                    retention=effective_config.log_file_retention,
+                    serialize=effective_config.log_file_serialize,
                 )
-                file_logging_enabled = True  # Mark enabled only on success
-            except LoggerSetupError as e:
-                if e.args[0]:
-                    logging.exception(
-                        f'Failed file sink setup: {e.args[0]}. File log disabled.',
-                    )
-                else:
-                    logging.exception('Failed file sink setup. File log disabled.', exc_info=e)
-            except Exception as e:
-                logging.exception('Unexpected file sink setup error. File log disabled.', exc_info=e)
-        else:
-            file_logging_enabled = False
+                file_logging_enabled = True
+            except LoggerSetupError as e_sink:
+                file_logging_error_reason = (
+                    e_sink.args[0] if e_sink.args else 'Loguru file sink configuration failed'
+                )
+                logging.exception(f'{file_logging_error_reason}. File logging disabled.', exc_info=e_sink)
+            except Exception as e_sink_unexp:
+                file_logging_error_reason = 'Unexpected error setting up file sink'
+                logging.exception(
+                    f'{file_logging_error_reason}. File logging disabled.', exc_info=e_sink_unexp,
+                )
+            # If sink setup failed, ensure we report it as disabled
+            if not file_logging_enabled:
+                actual_log_path = None  # Clear path if sink setup failed
 
         # --- Final Summary Log ---
         status = 'ENABLED' if file_logging_enabled else 'DISABLED'
-        level_name = logging.getLevelName(config.file_level) if file_logging_enabled else 'N/A'
-        path_info = f'Path: {actual_log_path}' if actual_log_path else 'N/A'
-        console_type = 'Rich' if config.use_rich_console else 'Loguru Std'
-        tb_type = (
-            'Simple' if config.use_simple_tracebacks else ('Rich' if config.use_rich_console else 'Loguru')
+        # Ensure level_name uses the config value, not the potentially adjusted min_level
+        level_name = logging.getLevelName(effective_config.file_level)
+        path_info = (
+            f'Path: {actual_log_path}'
+            if actual_log_path
+            else f'Reason: {file_logging_error_reason or "N/A"}'
         )
-        summary_log = logging.getLogger('standard_logger.setup')  # Use dedicated setup logger
-        summary_log.debug(
-            f'Logger setup complete. Console:{console_type}@{logging.getLevelName(config.console_level)} TB:{tb_type}. File:{status}@{level_name} Path:{path_info}',
+        console_type = 'Rich' if effective_config.use_rich_console else 'Loguru StdErr'
+        tb_cfg = effective_config.use_simple_tracebacks
+        tb_type = 'Simple' if tb_cfg else ('Rich' if effective_config.use_rich_console else 'Loguru')
+        locals_info = (
+            f'(Locals: {"Yes" if effective_config.show_locals_on_exception and not tb_cfg else "No"})'
+            if not tb_cfg
+            else ''
         )
-        if file_logging_error and not file_logging_enabled:
-            summary_log.debug(f'File log disabled reason: {file_logging_error}')
-        else:
-            return file_logging_enabled, actual_log_path
-    # --- Error Handling ---
+
+        summary_log = logging.getLogger('standard_logger.setup')
+        summary_log.info(
+            f'Logging Setup: Console={console_type}@{logging.getLevelName(effective_config.console_level)} '
+            f'Traceback={tb_type}{locals_info} | '
+            f'File={status}@{level_name} {path_info}',  # Path info now reflects final path/reason
+        )
+
+    # --- Critical Error Handling ---
     except LoggerSetupError as critical_error:
         _raise_critical(f'CRITICAL LOGGER SETUP FAILED: {critical_error}', critical_error, re_raise=True)
     except Exception as unexpected_error:
         _raise_critical('UNEXPECTED CRITICAL LOGGER SETUP ERROR', unexpected_error)
+    else:
+        return file_logging_enabled, actual_log_path
     return False, None
